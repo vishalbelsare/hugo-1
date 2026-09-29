@@ -18,6 +18,8 @@ import (
 	"html"
 	"html/template"
 	"regexp"
+	"slices"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 
@@ -39,13 +41,13 @@ type htmlTag struct {
 	openTag bool
 }
 
-// Truncate truncates a given string to the specified length.
-func (ns *Namespace) Truncate(a interface{}, options ...interface{}) (template.HTML, error) {
-	length, err := cast.ToIntE(a)
+// Truncate truncates the string in s to the specified length.
+func (ns *Namespace) Truncate(s any, options ...any) (template.HTML, error) {
+	length, err := cast.ToIntE(s)
 	if err != nil {
 		return "", err
 	}
-	var textParam interface{}
+	var textParam any
 	var ellipsis string
 
 	switch len(options) {
@@ -66,9 +68,7 @@ func (ns *Namespace) Truncate(a interface{}, options ...interface{}) (template.H
 	default:
 		return "", errors.New("too many arguments passed to truncate")
 	}
-	if err != nil {
-		return "", errors.New("text to truncate must be a string")
-	}
+
 	text, err := cast.ToStringE(textParam)
 	if err != nil {
 		return "", errors.New("text must be a string")
@@ -92,12 +92,12 @@ func (ns *Namespace) Truncate(a interface{}, options ...interface{}) (template.H
 		}
 
 		if isHTML {
-			// Make sure we keep tag of HTML tags
+			// Make sure we keep tagname of HTML tags
 			slice := text[i:]
 			m := tagRE.FindStringSubmatchIndex(slice)
 			if len(m) > 0 && m[0] == 0 {
 				nextTag = i + m[1]
-				tagname := slice[m[4]:m[5]]
+				tagname := strings.Fields(slice[m[4]:m[5]])[0]
 				lastWordIndex = lastNonSpace
 				_, singlet := htmlSinglets[tagname]
 				if !singlet && m[6] == -1 {
@@ -112,7 +112,11 @@ func (ns *Namespace) Truncate(a interface{}, options ...interface{}) (template.H
 		if unicode.IsSpace(r) {
 			lastWordIndex = lastNonSpace
 		} else if unicode.In(r, unicode.Han, unicode.Hangul, unicode.Hiragana, unicode.Katakana) {
-			lastWordIndex = i
+			lastWordIndex = lastNonSpace
+			lastNonSpace = i + utf8.RuneLen(r)
+			if currentLen <= length {
+				lastWordIndex = lastNonSpace
+			}
 		} else {
 			lastNonSpace = i + utf8.RuneLen(r)
 		}
@@ -123,13 +127,14 @@ func (ns *Namespace) Truncate(a interface{}, options ...interface{}) (template.H
 			} else {
 				endTextPos = lastWordIndex
 			}
-			out := text[0:endTextPos]
+			var out strings.Builder
+			out.WriteString(text[0:endTextPos])
 			if isHTML {
-				out += ellipsis
+				out.WriteString(ellipsis)
 				// Close out any open HTML tags
 				var currentTag *htmlTag
-				for i := len(tags) - 1; i >= 0; i-- {
-					tag := tags[i]
+				for _, tag := range slices.Backward(tags) {
+
 					if tag.pos >= endTextPos || currentTag != nil {
 						if currentTag != nil && currentTag.name == tag.name {
 							currentTag = nil
@@ -138,15 +143,15 @@ func (ns *Namespace) Truncate(a interface{}, options ...interface{}) (template.H
 					}
 
 					if tag.openTag {
-						out += ("</" + tag.name + ">")
+						out.WriteString(("</" + tag.name + ">"))
 					} else {
 						currentTag = &tag
 					}
 				}
 
-				return template.HTML(out), nil
+				return template.HTML(out.String()), nil
 			}
-			return template.HTML(html.EscapeString(out) + ellipsis), nil
+			return template.HTML(html.EscapeString(out.String()) + ellipsis), nil
 		}
 	}
 

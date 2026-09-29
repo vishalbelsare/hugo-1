@@ -14,6 +14,7 @@
 package hugolib
 
 import (
+	"context"
 	"sync"
 
 	"github.com/gohugoio/hugo/navigation"
@@ -29,22 +30,20 @@ type pageMenus struct {
 }
 
 func (p *pageMenus) HasMenuCurrent(menuID string, me *navigation.MenuEntry) bool {
-	p.p.s.init.menus.Do()
+	_ = p.p.s.init.menus.Value(context.Background())
 	p.init()
 	return p.q.HasMenuCurrent(menuID, me)
 }
 
 func (p *pageMenus) IsMenuCurrent(menuID string, inme *navigation.MenuEntry) bool {
-	p.p.s.init.menus.Do()
+	_ = p.p.s.init.menus.Value(context.Background())
 	p.init()
 	return p.q.IsMenuCurrent(menuID, inme)
 }
 
 func (p *pageMenus) Menus() navigation.PageMenus {
-	// There is a reverse dependency here. initMenus will, once, build the
-	// site menus and update any relevant page.
-	p.p.s.init.menus.Do()
-
+	// There is a reverse dependency here.
+	_ = p.p.s.init.menus.Value(context.Background())
 	return p.menus()
 }
 
@@ -61,8 +60,22 @@ func (p *pageMenus) init() {
 			p.p,
 		)
 
+		params := p.p.Params()
+
+		var menus any
+		var ok bool
+
+		if p.p.m.pageConfig.Menus != nil {
+			menus = p.p.m.pageConfig.Menus
+		} else {
+			menus, ok = params["menus"]
+			if !ok {
+				menus = params["menu"]
+			}
+		}
+
 		var err error
-		p.pm, err = navigation.PageMenusFromPage(p.p)
+		p.pm, err = navigation.PageMenusFromPage(menus, p.p)
 		if err != nil {
 			p.p.s.Log.Errorln(p.p.wrapError(err))
 		}

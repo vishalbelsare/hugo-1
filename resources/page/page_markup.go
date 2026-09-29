@@ -1,0 +1,525 @@
+// Copyright 2024 The Hugo Authors. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package page
+
+import (
+	"context"
+	"html/template"
+	"regexp"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/gohugoio/hugo/common/types"
+	"github.com/gohugoio/hugo/markup/tableofcontents"
+	"github.com/gohugoio/hugo/media"
+	"github.com/gohugoio/hugo/tpl"
+)
+
+type Content interface {
+	Content(context.Context) (template.HTML, error)
+	ContentWithoutSummary(context.Context) (template.HTML, error)
+	Summary(context.Context) (Summary, error)
+	Plain(context.Context) string
+	PlainWords(context.Context) []string
+	WordCount(context.Context) int
+	FuzzyWordCount(context.Context) int
+	ReadingTime(context.Context) int
+	Len(context.Context) int
+}
+
+type Markup interface {
+	Render(context.Context) (Content, error)
+	RenderString(ctx context.Context, args ...any) (template.HTML, error)
+	RenderShortcodes(context.Context) (template.HTML, error)
+	Fragments(context.Context) *tableofcontents.Fragments
+}
+
+var _ types.PrintableValueProvider = Summary{}
+
+const (
+	SummaryTypeAuto        = "auto"
+	SummaryTypeManual      = "manual"
+	SummaryTypeFrontMatter = "frontmatter"
+)
+
+type Summary struct {
+	Text      template.HTML
+	Type      string // "auto", "manual" or "frontmatter"
+	Truncated bool
+}
+
+func (s Summary) IsZero() bool {
+	return s.Text == ""
+}
+
+func (s Summary) PrintableValue() any {
+	return s.Text
+}
+
+var _ types.PrintableValueProvider = (*Summary)(nil)
+
+type HtmlSummary struct {
+	source         string
+	SummaryLowHigh types.LowHigh[string]
+	SummaryEndTag  types.LowHigh[string]
+	WrapperStart   types.LowHigh[string]
+	WrapperEnd     types.LowHigh[string]
+	Divider        types.LowHigh[string]
+}
+
+func (s HtmlSummary) wrap(ss string) string {
+	if s.WrapperStart.IsZero() {
+		return ss
+	}
+	return s.source[s.WrapperStart.Low:s.WrapperStart.High] + ss + s.source[s.WrapperEnd.Low:s.WrapperEnd.High]
+}
+
+func (s HtmlSummary) wrapLeft(ss string) string {
+	if s.WrapperStart.IsZero() {
+		return ss
+	}
+
+	return s.source[s.WrapperStart.Low:s.WrapperStart.High] + ss
+}
+
+func (s HtmlSummary) Value(l types.LowHigh[string]) string {
+	return s.source[l.Low:l.High]
+}
+
+func (s HtmlSummary) trimSpace(ss string) string {
+	return strings.TrimSpace(ss)
+}
+
+func (s HtmlSummary) Content() string {
+	if s.Divider.IsZero() {
+		return s.trimSpace(s.source)
+	}
+	ss := s.source[:s.Divider.Low]
+	ss += s.source[s.Divider.High:]
+	return s.trimSpace(ss)
+}
+
+func (s HtmlSummary) Summary() string {
+	if s.Divider.IsZero() {
+		return s.trimSpace(s.wrap(s.Value(s.SummaryLowHigh)))
+	}
+	ss := s.source[s.SummaryLowHigh.Low:s.Divider.Low]
+	if s.SummaryLowHigh.High > s.Divider.High {
+		ss += s.source[s.Divider.High:s.SummaryLowHigh.High]
+	}
+	if !s.SummaryEndTag.IsZero() {
+		ss += s.Value(s.SummaryEndTag)
+	}
+	return s.trimSpace(s.wrap(ss))
+}
+
+func (s HtmlSummary) ContentWithoutSummary() string {
+	if s.Divider.IsZero() {
+		if s.SummaryLowHigh.Low == s.WrapperStart.High && s.SummaryLowHigh.High == s.WrapperEnd.Low {
+			return ""
+		}
+		return s.trimSpace(s.wrapLeft(s.source[s.SummaryLowHigh.High:]))
+	}
+	if s.SummaryEndTag.IsZero() {
+		return s.trimSpace(s.wrapLeft(s.source[s.Divider.High:]))
+	}
+	return s.trimSpace(s.wrapLeft(s.source[s.SummaryEndTag.High:]))
+}
+
+func (s HtmlSummary) Truncated() bool {
+	return s.Summary() != s.Content()
+}
+
+func (s *HtmlSummary) resolveParagraphTagAndSetWrapper(mt media.Type) tagReStartEnd {
+	ptag := startEndP
+
+	switch mt.SubType {
+	case media.DefaultContentTypes.AsciiDoc.SubType:
+		ptag = startEndDiv
+	case media.DefaultContentTypes.ReStructuredText.SubType:
+		const markerStart = "<div class=\"document\">"
+		const markerEnd = "</div>"
+		i1 := strings.Index(s.source, markerStart)
+		i2 := strings.LastIndex(s.source, markerEnd)
+		if i1 > -1 && i2 > -1 {
+			s.WrapperStart = types.LowHigh[string]{Low: 0, High: i1 + len(markerStart)}
+			s.WrapperEnd = types.LowHigh[string]{Low: i2, High: len(s.source)}
+		}
+	}
+	return ptag
+}
+
+// Avoid counting words that are most likely HTML tokens.
+var (
+	isProbablyHTMLTag      = regexp.MustCompile(`^<\/?[A-Za-z]+>?$`)
+	isProablyHTMLAttribute = regexp.MustCompile(`^[A-Za-z]+=["']`)
+)
+
+func isProbablyHTMLToken(s string) bool {
+	return s == ">" || isProbablyHTMLTag.MatchString(s) || isProablyHTMLAttribute.MatchString(s)
+}
+
+// ExtractSummaryFromHTML extracts a summary from the given HTML content.
+func ExtractSummaryFromHTML(mt media.Type, input string, numWords int, isCJK bool) (result HtmlSummary) {
+	result.source = input
+	ptag := result.resolveParagraphTagAndSetWrapper(mt)
+
+	if numWords <= 0 {
+		return result
+	}
+
+	var count int
+
+	countWord := func(word string) int {
+		word = strings.TrimSpace(word)
+		if len(word) == 0 {
+			return 0
+		}
+		if isProbablyHTMLToken(word) {
+			return 0
+		}
+
+		if isCJK {
+			word = tpl.StripHTML(word)
+			runeCount := utf8.RuneCountInString(word)
+			if len(word) == runeCount {
+				return 1
+			} else {
+				return runeCount
+			}
+		}
+
+		return 1
+	}
+
+	high := len(input)
+	if result.WrapperEnd.Low > 0 {
+		high = result.WrapperEnd.Low
+	}
+
+	for j := result.WrapperStart.High; j < high; {
+		s := input[j:]
+		closingIndex := strings.Index(s, "</"+ptag.tagName+">")
+
+		if closingIndex == -1 {
+			break
+		}
+
+		s = s[:closingIndex]
+
+		// Count the words in the current paragraph.
+		var wi int
+
+		for i, r := range s {
+			if unicode.IsSpace(r) || (i+utf8.RuneLen(r) == len(s)) {
+				word := s[wi:i]
+				count += countWord(word)
+				wi = i
+				if count >= numWords {
+					break
+				}
+			}
+		}
+
+		if count >= numWords {
+			summaryHigh := j + closingIndex + len(ptag.tagName) + 3
+			summaryHigh = expandSummaryHighToBalancedHTML(input, result.WrapperStart.High, summaryHigh, high)
+			result.SummaryLowHigh = types.LowHigh[string]{
+				Low:  result.WrapperStart.High,
+				High: summaryHigh,
+			}
+			return
+		}
+
+		j += closingIndex + len(ptag.tagName) + 2
+
+	}
+
+	result.SummaryLowHigh = types.LowHigh[string]{
+		Low:  result.WrapperStart.High,
+		High: high,
+	}
+
+	return
+}
+
+// expandSummaryHighToBalancedHTML moves high forward until every element
+// opened in input[low:high] is closed, so the summary does not end inside
+// e.g. a blockquote or list item.
+func expandSummaryHighToBalancedHTML(input string, low, high, maxHigh int) int {
+	if low >= high || high >= maxHigh {
+		return high
+	}
+
+	var buf [16]string
+	stack := buf[:0]
+	sc := htmlTagScanner{s: input, pos: low}
+
+	for {
+		name, end, ok := sc.next(high)
+		if !ok {
+			break
+		}
+		stack = pushOrPopHTMLStack(stack, name, end)
+	}
+
+	if len(stack) == 0 {
+		return high
+	}
+
+	for {
+		name, end, ok := sc.next(maxHigh)
+		if !ok {
+			return high
+		}
+		stack = pushOrPopHTMLStack(stack, name, end)
+		if len(stack) == 0 {
+			return sc.pos
+		}
+	}
+}
+
+func pushOrPopHTMLStack(stack []string, name string, end bool) []string {
+	if end {
+		for i := len(stack) - 1; i >= 0; i-- {
+			if stack[i] == name {
+				return stack[:i]
+			}
+		}
+		return stack
+	}
+	if isVoidHTMLElement(name) {
+		return stack
+	}
+	return append(stack, name)
+}
+
+// htmlTagScanner is a minimal, allocation-free scanner for start and end tags.
+// It skips comments, quoted attribute values and raw text elements.
+type htmlTagScanner struct {
+	s   string
+	pos int
+}
+
+// next returns the lowercased name of the next tag before limit and
+// whether it is an end tag. ok is false when no more tags are found.
+func (sc *htmlTagScanner) next(limit int) (name string, end, ok bool) {
+	for {
+		i := strings.IndexByte(sc.s[sc.pos:limit], '<')
+		if i == -1 {
+			sc.pos = limit
+			return "", false, false
+		}
+		sc.pos += i + 1
+		if sc.pos >= limit {
+			return "", false, false
+		}
+
+		end = false
+		switch c := sc.s[sc.pos]; c {
+		case '!', '?':
+			if strings.HasPrefix(sc.s[sc.pos:limit], "!--") {
+				sc.skipPast(limit, "-->")
+			} else {
+				sc.skipPast(limit, ">")
+			}
+			continue
+		case '/':
+			end = true
+			sc.pos++
+		}
+
+		start := sc.pos
+		for sc.pos < limit && isHTMLTagNameByte(sc.s[sc.pos]) {
+			sc.pos++
+		}
+		if sc.pos == start {
+			continue
+		}
+		name = strings.ToLower(sc.s[start:sc.pos])
+
+		selfClosing := false
+		for sc.pos < limit {
+			c := sc.s[sc.pos]
+			sc.pos++
+			switch c {
+			case '"', '\'':
+				sc.skipPast(limit, string(c))
+			case '/':
+				selfClosing = true
+			case '>':
+				if selfClosing {
+					continue
+				}
+				if !end && isRawTextHTMLElement(name) {
+					sc.skipPastEndTag(limit, name)
+				}
+				return name, end, true
+			default:
+				selfClosing = false
+			}
+		}
+		return name, end, true
+	}
+}
+
+func (sc *htmlTagScanner) skipPast(limit int, sep string) {
+	if i := strings.Index(sc.s[sc.pos:limit], sep); i == -1 {
+		sc.pos = limit
+	} else {
+		sc.pos += i + len(sep)
+	}
+}
+
+func (sc *htmlTagScanner) skipPastEndTag(limit int, name string) {
+	for {
+		sc.skipPast(limit, "</")
+		if sc.pos >= limit {
+			return
+		}
+		if rest := sc.s[sc.pos:limit]; len(rest) > len(name) && strings.EqualFold(rest[:len(name)], name) && !isHTMLTagNameByte(rest[len(name)]) {
+			sc.pos -= 2
+			return
+		}
+	}
+}
+
+func isHTMLTagNameByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-'
+}
+
+func isRawTextHTMLElement(name string) bool {
+	switch name {
+	case "script", "style", "textarea", "title", "iframe", "xmp", "noembed", "noframes":
+		return true
+	}
+	return false
+}
+
+func isVoidHTMLElement(name string) bool {
+	switch name {
+	case "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr":
+		return true
+	}
+	return false
+}
+
+// ExtractSummaryFromHTMLWithDivider extracts a summary from the given HTML content with
+// a manual summary divider.
+func ExtractSummaryFromHTMLWithDivider(mt media.Type, input, divider string) (result HtmlSummary) {
+	result.source = input
+	result.Divider.Low = strings.Index(input, divider)
+	result.Divider.High = result.Divider.Low + len(divider)
+
+	if result.Divider.Low == -1 {
+		// No summary.
+		return
+	}
+
+	ptag := result.resolveParagraphTagAndSetWrapper(mt)
+
+	if !mt.IsHTML() {
+		result.Divider, result.SummaryEndTag = expandSummaryDivider(result.source, ptag, result.Divider)
+	}
+
+	result.SummaryLowHigh = types.LowHigh[string]{
+		Low:  result.WrapperStart.High,
+		High: result.Divider.Low,
+	}
+
+	return
+}
+
+var (
+	pOrDiv = regexp.MustCompile(`<p[^>]?>|<div[^>]?>$`)
+
+	startEndDiv = tagReStartEnd{
+		startEndOfString: regexp.MustCompile(`<div[^>]*?>$`),
+		endEndOfString:   regexp.MustCompile(`</div>$`),
+		tagName:          "div",
+	}
+
+	startEndP = tagReStartEnd{
+		startEndOfString: regexp.MustCompile(`<p[^>]*?>$`),
+		endEndOfString:   regexp.MustCompile(`</p>$`),
+		tagName:          "p",
+	}
+)
+
+type tagReStartEnd struct {
+	startEndOfString *regexp.Regexp
+	endEndOfString   *regexp.Regexp
+	tagName          string
+}
+
+func expandSummaryDivider(s string, re tagReStartEnd, divider types.LowHigh[string]) (types.LowHigh[string], types.LowHigh[string]) {
+	var endMarkup types.LowHigh[string]
+
+	if divider.IsZero() {
+		return divider, endMarkup
+	}
+
+	lo, hi := divider.Low, divider.High
+
+	var preserveEndMarkup bool
+
+	// Find the start of the paragraph.
+
+	for i := lo - 1; i >= 0; i-- {
+		if s[i] == '>' {
+			if match := re.startEndOfString.FindString(s[:i+1]); match != "" {
+				lo = i - len(match) + 1
+				break
+			}
+			if match := pOrDiv.FindString(s[:i+1]); match != "" {
+				i -= len(match) - 1
+				continue
+			}
+		}
+
+		r, _ := utf8.DecodeRuneInString(s[i:])
+		if !unicode.IsSpace(r) {
+			preserveEndMarkup = true
+			break
+		}
+	}
+
+	divider.Low = lo
+
+	// Now walk forward to the end of the paragraph.
+	for ; hi < len(s); hi++ {
+		if s[hi] != '>' {
+			continue
+		}
+		if match := re.endEndOfString.FindString(s[:hi+1]); match != "" {
+			hi++
+			break
+		}
+	}
+
+	if preserveEndMarkup {
+		endMarkup.Low = divider.High
+		endMarkup.High = hi
+	} else {
+		divider.High = hi
+	}
+
+	// Consume trailing newline if any.
+	if divider.High < len(s) && s[divider.High] == '\n' {
+		divider.High++
+	}
+
+	return divider, endMarkup
+}
